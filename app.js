@@ -1,14 +1,14 @@
 const video = document.getElementById('vid');
 
-// screen canvas (what you see) — always full viewport, letterboxed
+// screen canvas (viewport display) — letterboxed, never stretched
 const screen = document.getElementById('screen');
 const sctx = screen.getContext('2d', { willReadFrequently: true });
 
-// frame canvas (the REAL output) — true aspect (1:1, 16:9, etc.)
+// frame canvas (TRUE output) — chosen aspect (1:1, 16:9, etc.)
 const frame = document.createElement('canvas');
 const fctx = frame.getContext('2d', { willReadFrequently: true });
 
-// low-res processing buffer
+// low-res processing buffer (same aspect as frame)
 const low = document.createElement('canvas');
 const lctx = low.getContext('2d', { willReadFrequently: true });
 
@@ -17,6 +17,7 @@ const fb = document.createElement('canvas');
 const fbctx = fb.getContext('2d', { willReadFrequently: true });
 
 const panel = document.getElementById('panel');
+const showHudBtn = document.getElementById('showHud');
 
 const ui = {
   flip: document.getElementById('flip'),
@@ -26,6 +27,7 @@ const ui = {
   tip:  document.getElementById('tip'),
 
   format: document.getElementById('format'),
+  paletteMode: document.getElementById('paletteMode'),
 
   t_blocks: document.getElementById('t_blocks'),
   t_bit: document.getElementById('t_bit'),
@@ -46,9 +48,12 @@ let facingMode = "environment";
 let stream = null;
 let bendBurst = 0;
 let lastKey = "";
+let hudHidden = false;
 
 function clamp(v,a,b){ return Math.max(a, Math.min(b,v)); }
 function rand(n=1){ return Math.random()*n; }
+function lerp(a,b,t){ return a + (b-a)*t; }
+function lerp3(c1,c2,t){ return [lerp(c1[0],c2[0],t), lerp(c1[1],c2[1],t), lerp(c1[2],c2[2],t)]; }
 
 function dateStamp(){
   const d = new Date();
@@ -58,7 +63,17 @@ function dateStamp(){
   return `${yyyy}/${mm}/${dd}`;
 }
 
-/* ----------- FORMAT LOGIC ----------- */
+/* ---------- HUD VISIBILITY ---------- */
+
+function setHudHidden(v){
+  hudHidden = !!v;
+  panel.classList.toggle('hidden', hudHidden);
+  showHudBtn.classList.toggle('show', hudHidden);
+  ui.hud.textContent = hudHidden ? "SHOW HUD" : "HIDE HUD";
+}
+setHudHidden(false);
+
+/* ---------- FORMAT ---------- */
 
 function viewportSize(){
   const vw = Math.floor(window.visualViewport?.width || window.innerWidth);
@@ -77,64 +92,51 @@ function chosenMode(){
   return m;
 }
 
-// returns aspect ratio (width/height) for the REAL frame
 function modeAspect(mode){
   if (mode === 'square') return 1;
   if (mode === 'landscape') return 16/9;
-  // portrait: use device-ish portrait aspect (fallback 9:16)
+
+  // portrait: keep a portrait-ish ratio even if device is landscape
   const { vw, vh } = viewportSize();
   const ar = vw / vh;
-  // if user forces portrait while device is landscape, still keep a portrait ratio
-  return clamp(ar, 9/19.5, 9/14); // roughly typical iPhone portrait range
+  return clamp(ar, 9/19.5, 9/14);
 }
 
-/* ----------- RESIZE PIPELINE ----------- */
+/* ---------- RESIZE ---------- */
 
 function resizeAll(){
   const { vw, vh } = viewportSize();
   const dpr = Math.min(2, window.devicePixelRatio || 1);
 
-  // screen canvas matches viewport
   screen.width  = Math.floor(vw * dpr);
   screen.height = Math.floor(vh * dpr);
 
   const mode = chosenMode();
-  const ar = modeAspect(mode); // frame aspect (w/h)
+  const ar = modeAspect(mode);
 
-  // choose frame size based on RES slider (controls "detail")
-  // RES is the SHORT SIDE of the frame for consistency
-  const res = parseInt(ui.s_res.value, 10);
+  const res = parseInt(ui.s_res.value, 10); // short side
   let fw, fh;
-
-  if (ar >= 1){
-    // wider than tall
-    fh = res;
-    fw = Math.round(res * ar);
-  } else {
-    // taller than wide
-    fw = res;
-    fh = Math.round(res / ar);
-  }
+  if (ar >= 1){ fh = res; fw = Math.round(res * ar); }
+  else { fw = res; fh = Math.round(res / ar); }
 
   frame.width = fw;
   frame.height = fh;
 
-  // low-res buffer mirrors frame aspect (smaller)
   const lowRes = Math.max(120, Math.floor(res * 0.85));
   let lw, lh;
   if (ar >= 1){ lh = lowRes; lw = Math.round(lowRes * ar); }
   else { lw = lowRes; lh = Math.round(lowRes / ar); }
+
   low.width = lw;
   low.height = lh;
 
-  // feedback buffer matches frame
   fb.width = frame.width;
   fb.height = frame.height;
 
-  ui.tip.innerHTML = `Mode: <b>${mode.toUpperCase()}</b> • Frame: <b>${frame.width}×${frame.height}</b> • SNAP saves true crop`;
+  ui.tip.innerHTML = `Mode: <b>${mode.toUpperCase()}</b> • SNAP saves <b>${frame.width}×${frame.height}</b>`;
 }
 
-/* ----------- DRAW VIDEO CROPPED TO ASPECT (NO STRETCH) ----------- */
+/* ---------- VIDEO DRAW (CROP, NO STRETCH) ---------- */
 
 function drawVideoCoverTo(ctx, W, H){
   const vw = video.videoWidth || 1280;
@@ -146,12 +148,10 @@ function drawVideoCoverTo(ctx, W, H){
   let sx=0, sy=0, sW=vw, sH=vh;
 
   if (srcAspect > dstAspect){
-    // source wider: crop left/right
     sH = vh;
     sW = vh * dstAspect;
     sx = (vw - sW) / 2;
   } else {
-    // source taller: crop top/bottom
     sW = vw;
     sH = vw / dstAspect;
     sy = (vh - sH) / 2;
@@ -160,7 +160,7 @@ function drawVideoCoverTo(ctx, W, H){
   ctx.drawImage(video, sx, sy, sW, sH, 0, 0, W, H);
 }
 
-/* ----------- EFFECTS ----------- */
+/* ---------- EFFECTS ---------- */
 
 function bitcrush(img, amt){
   const d = img.data;
@@ -173,7 +173,7 @@ function bitcrush(img, amt){
   }
 }
 
-// safe chromatic (no screen-kill)
+// ✅ Fixed chromatic (no "solid slab")
 function chromaSplit(img, amt){
   if (amt <= 0.001) return;
 
@@ -182,9 +182,11 @@ function chromaSplit(img, amt){
   const out = new Uint8ClampedArray(d.length);
 
   const maxShift = Math.floor(amt * 6 + bendBurst * 4);
+
   const rx = (Math.random()<0.5?-1:1) * Math.floor(rand(maxShift+1));
   const gx = (Math.random()<0.5?-1:1) * Math.floor(rand(maxShift+1));
   const bx = (Math.random()<0.5?-1:1) * Math.floor(rand(maxShift+1));
+
   const ry = (Math.random()<0.5?-1:1) * Math.floor(rand(maxShift+1));
   const gy = (Math.random()<0.5?-1:1) * Math.floor(rand(maxShift+1));
   const by = (Math.random()<0.5?-1:1) * Math.floor(rand(maxShift+1));
@@ -199,7 +201,6 @@ function chromaSplit(img, amt){
   for (let y=0; y<h; y++){
     for (let x=0; x<w; x++){
       const i = (y*w + x)*4;
-
       const r = sample(x+rx, y+ry, 0);
       const g = sample(x+gx, y+gy, 1);
       const b = sample(x+bx, y+by, 2);
@@ -225,18 +226,49 @@ function noise(img, amt){
   }
 }
 
+/* Palette mapper */
+function paletteRGB(lum, mode){
+  lum = clamp(lum, 0, 1);
+
+  const grad2 = (a,b) => lerp3(a,b,lum);
+  const grad3 = (a,b,c) => {
+    if (lum < 0.5) return lerp3(a,b, lum/0.5);
+    return lerp3(b,c, (lum-0.5)/0.5);
+  };
+
+  const NEON_G_P      = grad3([10,255,120],[255,60,200],[255,240,80]);
+  const PURPLE_ORANGE = grad3([90,20,255],[255,60,160],[255,150,40]);
+  const RED_BLUE      = grad3([255,40,40],[40,120,255],[255,230,90]);
+  const RED_BLACK     = grad2([0,0,0],[255,40,40]);
+  const CMY           = grad3([0,255,255],[255,0,255],[255,255,0]);
+  const AMBER_TEAL    = grad3([20,220,210],[255,170,50],[255,245,210]);
+
+  switch(mode){
+    case "purple_orange": return PURPLE_ORANGE;
+    case "red_blue":      return RED_BLUE;
+    case "red_black":     return RED_BLACK;
+    case "cmy":           return CMY;
+    case "amber_teal":    return AMBER_TEAL;
+    case "neon":
+    default:              return NEON_G_P;
+  }
+}
+
 function falseColor(img, amt){
   const d = img.data;
-  const k = amt;
-  for (let i=0; i<d.length; i+=4){
-    const lum = (0.2126*d[i] + 0.7152*d[i+1] + 0.0722*d[i+2]) / 255;
-    const r = clamp(255*(1-lum)*(0.6+0.4*k) + 40*k, 0, 255);
-    const g = clamp(255*(lum)  *(0.8+0.2*k) + 30*k, 0, 255);
-    const b = clamp(255*(0.35 + 0.65*Math.sin(lum*3.1415))*(0.7+0.3*k), 0, 255);
+  const mode = ui.paletteMode?.value || "neon";
+  const k = clamp(amt, 0, 1);
 
-    d[i]   = clamp(d[i]*(1-k) + r*k, 0, 255);
-    d[i+1] = clamp(d[i+1]*(1-k) + g*k, 0, 255);
-    d[i+2] = clamp(d[i+2]*(1-k) + b*k, 0, 255);
+  const curve = (x) => Math.pow(x, 0.85);
+
+  for (let i=0; i<d.length; i+=4){
+    const r0 = d[i], g0 = d[i+1], b0 = d[i+2];
+    const lum = curve((0.2126*r0 + 0.7152*g0 + 0.0722*b0) / 255);
+    const [pr, pg, pb] = paletteRGB(lum, mode);
+
+    d[i]   = clamp(r0*(1-k) + pr*k, 0, 255);
+    d[i+1] = clamp(g0*(1-k) + pg*k, 0, 255);
+    d[i+2] = clamp(b0*(1-k) + pb*k, 0, 255);
   }
 }
 
@@ -309,13 +341,12 @@ function drawDate(){
   fctx.restore();
 }
 
-/* ----------- DISPLAY (LETTERBOX) ----------- */
+/* ---------- DISPLAY (LETTERBOX CONTAIN) ---------- */
 
 function drawFrameToScreen(){
   const SW = screen.width, SH = screen.height;
   const FW = frame.width, FH = frame.height;
 
-  // contain scale (no stretching)
   const scale = Math.min(SW / FW, SH / FH);
   const dw = Math.round(FW * scale);
   const dh = Math.round(FH * scale);
@@ -331,7 +362,7 @@ function drawFrameToScreen(){
   sctx.restore();
 }
 
-/* ----------- PRESETS ----------- */
+/* ---------- PRESETS ---------- */
 
 function applyPreset(name){
   const set = (id, v) => document.getElementById(id).checked = v;
@@ -341,33 +372,37 @@ function applyPreset(name){
     set("t_blocks", true); set("t_bit", true); set("t_feedback", true);
     set("t_noise", true); set("t_false", false); set("t_bars", false); set("t_date", true);
     setS("s_grit", 70); setS("s_corrupt", 48); setS("s_chroma", 22); setS("s_palette", 18); setS("s_res", 380);
+    ui.paletteMode.value = "neon";
   }
   if (name === "buffer"){
     set("t_blocks", true); set("t_bit", true); set("t_feedback", true);
     set("t_noise", true); set("t_false", true); set("t_bars", true); set("t_date", true);
     setS("s_grit", 82); setS("s_corrupt", 70); setS("s_chroma", 35); setS("s_palette", 62); setS("s_res", 320);
+    ui.paletteMode.value = "cmy";
   }
   if (name === "neon"){
     set("t_blocks", true); set("t_bit", true); set("t_feedback", true);
     set("t_noise", true); set("t_false", true); set("t_bars", false); set("t_date", true);
     setS("s_grit", 86); setS("s_corrupt", 62); setS("s_chroma", 40); setS("s_palette", 85); setS("s_res", 300);
+    ui.paletteMode.value = "purple_orange";
   }
   if (name === "digi"){
     set("t_blocks", false); set("t_bit", false); set("t_feedback", false);
     set("t_noise", true); set("t_false", false); set("t_bars", false); set("t_date", true);
     setS("s_grit", 26); setS("s_corrupt", 14); setS("s_chroma", 12); setS("s_palette", 18); setS("s_res", 560);
+    ui.paletteMode.value = "amber_teal";
   }
 
+  lastKey = "";
   resizeAll();
 }
 
-/* ----------- ACTIONS ----------- */
+/* ---------- ACTIONS ---------- */
 
 function snap(){
-  // SNAP saves the TRUE cropped frame (1:1 or 16:9 etc.)
   const a = document.createElement('a');
   a.download = `trashcam_v2_${new Date().toISOString().replace(/[:.]/g,'-')}.png`;
-  a.href = frame.toDataURL('image/png');
+  a.href = frame.toDataURL('image/png'); // true crop saved
   a.click();
 }
 
@@ -382,11 +417,12 @@ async function startCamera(){
   video.srcObject = stream;
   await new Promise(res => video.onloadedmetadata = res);
 
+  lastKey = "";
   resizeAll();
   requestAnimationFrame(loop);
 }
 
-/* ----------- MAIN LOOP ----------- */
+/* ---------- LOOP ---------- */
 
 function loop(){
   const mode = chosenMode();
@@ -407,27 +443,28 @@ function loop(){
   const grit = parseInt(ui.s_grit.value,10)/100;
   const corrupt = parseInt(ui.s_corrupt.value,10)/100;
   const chroma = parseInt(ui.s_chroma.value,10)/100;
-  const palette = parseInt(ui.s_palette.value,10)/100;
+  const paletteAmt = parseInt(ui.s_palette.value,10)/100;
 
   bendBurst = Math.max(0, bendBurst - 0.04);
 
-  // 1) draw camera into low-res buffer cropped to frame aspect
+  // 1) video -> low (cropped to aspect)
   lctx.setTransform(1,0,0,1,0,0);
   lctx.clearRect(0,0,low.width, low.height);
   drawVideoCoverTo(lctx, low.width, low.height);
 
-  // 2) process pixels on low buffer
+  // 2) process low pixels
   let img = lctx.getImageData(0,0,low.width, low.height);
 
   if (ui.t_blocks.checked) blockGlitch(img, corrupt);
   if (ui.t_bit.checked) bitcrush(img, grit);
   chromaSplit(img, chroma);
   if (ui.t_noise.checked) noise(img, grit);
-  if (ui.t_false.checked) falseColor(img, palette);
+
+  if (ui.t_false.checked) falseColor(img, paletteAmt);
 
   lctx.putImageData(img, 0, 0);
 
-  // 3) upscale low -> frame (no stretch; same aspect by design)
+  // 3) low -> frame (same aspect, no stretch)
   fctx.save();
   fctx.setTransform(1,0,0,1,0,0);
   fctx.imageSmoothingEnabled = false;
@@ -435,44 +472,38 @@ function loop(){
   fctx.drawImage(low, 0,0,low.width,low.height, 0,0,frame.width,frame.height);
   fctx.restore();
 
-  // 4) overlays on frame
+  // 4) overlays
   if (ui.t_feedback.checked) feedbackPass(corrupt);
   if (ui.t_bars.checked) dataBars(corrupt + bendBurst*0.6);
   if (ui.t_date.checked) drawDate();
 
-  // 5) draw frame -> screen with letterbox contain (no stretch)
+  // 5) display
   drawFrameToScreen();
 
   requestAnimationFrame(loop);
 }
 
-/* ----------- UI EVENTS ----------- */
+/* ---------- EVENTS ---------- */
 
-ui.hud.addEventListener('click', () => {
-  panel.classList.toggle('hidden');
-});
+ui.hud.addEventListener('click', () => setHudHidden(!hudHidden));
+showHudBtn.addEventListener('click', () => setHudHidden(false));
 
 ui.flip.addEventListener('click', async () => {
   facingMode = (facingMode === "environment") ? "user" : "environment";
   await startCamera();
 });
 
-ui.bend.addEventListener('click', () => {
-  bendBurst = 1.0;
-});
-
+ui.bend.addEventListener('click', () => { bendBurst = 1.0; });
 ui.snap.addEventListener('click', snap);
 
 document.querySelectorAll('[data-preset]').forEach(btn => {
   btn.addEventListener('click', () => applyPreset(btn.dataset.preset));
 });
 
-ui.format.addEventListener('change', () => {
-  lastKey = "";
-  resizeAll();
-});
+ui.format.addEventListener('change', () => { lastKey=""; resizeAll(); });
+ui.paletteMode.addEventListener('change', () => { /* instant change */ });
 
-// rotate / viewport changes (AUTO flips here)
+// iOS dynamic viewport / rotation
 if (window.visualViewport){
   window.visualViewport.addEventListener('resize', () => { lastKey=""; resizeAll(); });
   window.visualViewport.addEventListener('scroll', () => { lastKey=""; resizeAll(); });
@@ -480,10 +511,10 @@ if (window.visualViewport){
 window.addEventListener('orientationchange', () => { lastKey=""; resizeAll(); });
 window.addEventListener('resize', () => { lastKey=""; resizeAll(); });
 
-/* ----------- BOOT ----------- */
+/* ---------- BOOT ---------- */
 (async () => {
   try{
-    ui.tip.innerHTML = "AUTO flips when you rotate • SNAP saves true crop (1:1 or 16:9).";
+    ui.tip.innerHTML = "AUTO flips with rotation • HUD button always recoverable • SNAP saves true crop.";
     await startCamera();
   }catch(err){
     document.body.innerHTML = `
