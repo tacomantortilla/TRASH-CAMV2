@@ -15,7 +15,7 @@
   <main class="app">
     <video id="vid" autoplay playsinline muted></video>
 
-    <!-- screen canvas (letterboxed display) -->
+    <!-- screen canvas (letterboxed display, never stretched) -->
     <canvas id="screen"></canvas>
 
     <header class="top">
@@ -29,6 +29,10 @@
       <button id="flip" class="btn glass">FLIP</button>
     </header>
 
+    <!-- FLOATING "SHOW HUD" BUTTON (only visible when HUD is hidden) -->
+    <button id="showHud" class="floatHud" aria-label="Show controls">SHOW HUD</button>
+
+    <!-- HUD / CONTROL PANEL -->
     <section class="panel" id="panel">
       <div class="row tight">
         <div class="pill">
@@ -38,6 +42,18 @@
             <option value="portrait">PORTRAIT</option>
             <option value="landscape">LANDSCAPE 16:9</option>
             <option value="square">SQUARE 1:1</option>
+          </select>
+        </div>
+
+        <div class="pill">
+          <div class="pillLabel">Palette</div>
+          <select id="paletteMode">
+            <option value="neon" selected>NEON (G/P)</option>
+            <option value="purple_orange">PURPLE / ORANGE</option>
+            <option value="red_blue">RED / BLUE</option>
+            <option value="red_black">RED / BLACK</option>
+            <option value="cmy">CMY GLITCH</option>
+            <option value="amber_teal">AMBER / TEAL</option>
           </select>
         </div>
       </div>
@@ -85,10 +101,10 @@
       <div class="actions">
         <button id="bend" class="btn primary">BEND</button>
         <button id="snap" class="btn">SNAP</button>
-        <button id="hud" class="btn">HUD</button>
+        <button id="hud" class="btn">HIDE HUD</button>
       </div>
 
-      <div class="tip" id="tip">AUTO will flip when you rotate your phone.</div>
+      <div class="tip" id="tip">AUTO flips with phone rotation • SNAP saves true crop.</div>
     </section>
   </main>
 
