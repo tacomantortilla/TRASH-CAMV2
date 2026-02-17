@@ -1,539 +1,377 @@
-// Trash Cam V2 — Photo-only CCD corruption web app (PWA-style)
+// TRASH CAM V2 (iOS/Safari-safe rebuild)
+// - uses dynamic viewport sizing + VisualViewport resize hook
+// - stable canvas pipeline (no vh traps)
+// - CCD-ish corruption effects (blocks, bitcrush, feedback, noise, false color, data bars)
+// - date stamp (date only) low-res
 
-const video = document.getElementById('v');
-const canvas = document.getElementById('c');
+const video = document.getElementById('vid');
+const canvas = document.getElementById('out');
 const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
 const ui = {
   flip: document.getElementById('flip'),
-  snap: document.getElementById('snap'),
   bend: document.getElementById('bend'),
-  random: document.getElementById('random'),
+  snap: document.getElementById('snap'),
   tip: document.getElementById('tip'),
 
-  e_rgb: document.getElementById('e_rgb'),
-  e_tear: document.getElementById('e_tear'),
-  e_blocks: document.getElementById('e_blocks'),
-  e_bit: document.getElementById('e_bit'),
-  e_feedback: document.getElementById('e_feedback'),
-  e_noise: document.getElementById('e_noise'),
-  e_false: document.getElementById('e_false'),
-  e_bars: document.getElementById('e_bars'),
-  e_date: document.getElementById('e_date'),
+  t_blocks: document.getElementById('t_blocks'),
+  t_bit: document.getElementById('t_bit'),
+  t_feedback: document.getElementById('t_feedback'),
+  t_noise: document.getElementById('t_noise'),
+  t_false: document.getElementById('t_false'),
+  t_bars: document.getElementById('t_bars'),
+  t_date: document.getElementById('t_date'),
 
-  grit: document.getElementById('grit'),
-  corrupt: document.getElementById('corrupt'),
-  chrom: document.getElementById('chrom'),
-  palette: document.getElementById('palette'),
-  res: document.getElementById('res'),
-
-  presetBtns: [...document.querySelectorAll('[data-preset]')]
+  s_grit: document.getElementById('s_grit'),
+  s_corrupt: document.getElementById('s_corrupt'),
+  s_chroma: document.getElementById('s_chroma'),
+  s_palette: document.getElementById('s_palette'),
+  s_res: document.getElementById('s_res'),
 };
 
 let facingMode = "environment";
 let stream = null;
 
-const state = {
-  grit: 0.62,
-  corrupt: 0.62,
-  chrom: 0.60,
-  palette: 0.75,
-  baseW: 360,
+// internal buffers
+const low = document.createElement('canvas');
+const lctx = low.getContext('2d', { willReadFrequently: true });
 
-  bendUntil: 0,
-  prevFrame: null
-};
+const fb = document.createElement('canvas'); // feedback buffer
+const fbctx = fb.getContext('2d', { willReadFrequently: true });
 
-function clamp01(x){ return Math.max(0, Math.min(1, x)); }
-function irand(n){ return Math.floor(Math.random() * n); }
+let bendBurst = 0;
 
-function hash2(x,y,t){
-  let n = x*374761393 + y*668265263 + t*69069;
-  n = (n ^ (n >> 13)) * 1274126177;
-  return ((n ^ (n >> 16)) >>> 0) / 4294967295;
-}
+function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
+function rand(n=1){ return Math.random()*n; }
 
-function readUI(){
-  state.grit = parseInt(ui.grit.value,10) / 100;
-  state.corrupt = parseInt(ui.corrupt.value,10) / 100;
-  state.chrom = parseInt(ui.chrom.value,10) / 100;
-  state.palette = parseInt(ui.palette.value,10) / 100;
-  state.baseW = parseInt(ui.res.value,10);
-}
+function setTip(msg){ ui.tip.innerHTML = msg; }
 
-function setTip(msg){
-  ui.tip.innerHTML = msg;
-}
-
-function bendSpike(ms=900){
-  state.bendUntil = performance.now() + ms;
-  setTip("BEND engaged: instability spike.");
-  setTimeout(() => setTip('Open in <b>Safari</b> + HTTPS. Hit <b>BEND</b> for a burst.'), ms + 200);
+function dateStamp(){
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth()+1).padStart(2,'0');
+  const dd = String(d.getDate()).padStart(2,'0');
+  return `${yyyy}/${mm}/${dd}`;
 }
 
 async function startCamera(){
-  if (stream) {
-    stream.getTracks().forEach(t => t.stop());
-    stream = null;
-  }
+  if (stream) stream.getTracks().forEach(t => t.stop());
 
   stream = await navigator.mediaDevices.getUserMedia({
-    video: {
-      facingMode,
-      width: { ideal: 1280 },
-      height: { ideal: 720 }
-    },
+    video: { facingMode, width: { ideal: 1280 }, height: { ideal: 720 } },
     audio: false
   });
 
   video.srcObject = stream;
   await new Promise(res => video.onloadedmetadata = res);
 
-  // canvas size based on baseW and camera aspect
-  const aspect = video.videoHeight / video.videoWidth || (9/16);
-  canvas.width = state.baseW;
-  canvas.height = Math.max(200, Math.round(state.baseW * aspect));
-
-  state.prevFrame = new Uint8ClampedArray(canvas.width * canvas.height * 4);
+  resizeAll();
   requestAnimationFrame(loop);
 }
 
-/* ---------------- Effects ---------------- */
+function resizeAll(){
+  // Output canvas matches visual viewport for iOS toolbar changes
+  const vw = Math.floor((window.visualViewport?.width || window.innerWidth));
+  const vh = Math.floor((window.visualViewport?.height || window.innerHeight));
 
-function rgbSplit(img, w, h, amt){
+  // Use devicePixelRatio but cap for performance
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+
+  canvas.width = Math.floor(vw * dpr);
+  canvas.height = Math.floor(vh * dpr);
+
+  // feedback buffer same size
+  fb.width = canvas.width;
+  fb.height = canvas.height;
+
+  // low-res buffer from slider
+  const res = parseInt(ui.s_res.value, 10);
+  const aspect = canvas.height / canvas.width || (16/9);
+  low.width = res;
+  low.height = Math.max(120, Math.round(res * aspect));
+}
+
+function drawCoverTo(targetCtx, W, H){
+  const vw = video.videoWidth || 1280;
+  const vh = video.videoHeight || 720;
+
+  const srcAspect = vw / vh;
+  const dstAspect = W / H;
+
+  let sx=0, sy=0, sW=vw, sH=vh;
+
+  if (srcAspect > dstAspect){
+    sH = vh;
+    sW = vh * dstAspect;
+    sx = (vw - sW) / 2;
+  } else {
+    sW = vw;
+    sH = vw / dstAspect;
+    sy = (vh - sH) / 2;
+  }
+
+  targetCtx.drawImage(video, sx, sy, sW, sH, 0, 0, W, H);
+}
+
+function bitcrush(img, amt){
+  const d = img.data;
+  const levels = Math.floor(2 + (1-amt) * 14); // stronger amt => fewer levels
+  const step = 255 / levels;
+
+  for (let i=0; i<d.length; i+=4){
+    d[i]   = Math.round(d[i]/step)*step;
+    d[i+1] = Math.round(d[i+1]/step)*step;
+    d[i+2] = Math.round(d[i+2]/step)*step;
+  }
+}
+
+function rgbSplit(img, amt){
+  const w = img.width, h = img.height;
   const d = img.data;
   const out = new Uint8ClampedArray(d.length);
+
+  const maxShift = Math.floor(amt * 10);
+  const rx = (Math.random()*2-1) * maxShift;
+  const gx = (Math.random()*2-1) * maxShift;
+  const bx = (Math.random()*2-1) * maxShift;
+
+  function sample(x,y,chan){
+    x = clamp(x,0,w-1); y = clamp(y,0,h-1);
+    return d[(y*w + x)*4 + chan];
+  }
+
   for (let y=0; y<h; y++){
     for (let x=0; x<w; x++){
       const i = (y*w + x)*4;
-      const rx = Math.max(0, Math.min(w-1, x + amt));
-      const bx = Math.max(0, Math.min(w-1, x - amt));
-      const iR = (y*w + rx)*4;
-      const iB = (y*w + bx)*4;
-      out[i]   = d[iR];
-      out[i+1] = d[i+1];
-      out[i+2] = d[iB+2];
+      out[i]   = sample(x+rx, y, 0);
+      out[i+1] = sample(x+gx, y, 1);
+      out[i+2] = sample(x+bx, y, 2);
       out[i+3] = 255;
     }
   }
-  d.set(out);
+
+  img.data.set(out);
 }
 
-function lineTear(img, w, h, strength, t){
+function noise(img, amt){
   const d = img.data;
-  const out = new Uint8ClampedArray(d.length);
-
-  const tearChance = 0.06 + strength * 0.22;
-  for (let y=0; y<h; y++){
-    let off = 0;
-    const n = hash2(y, 13, t);
-    if (n < tearChance){
-      off = Math.floor((hash2(y, 99, t) - 0.5) * (6 + strength*34));
-    }
-    for (let x=0; x<w; x++){
-      const sx = Math.max(0, Math.min(w-1, x + off));
-      const si = (y*w + sx)*4;
-      const di = (y*w + x)*4;
-      out[di]   = d[si];
-      out[di+1] = d[si+1];
-      out[di+2] = d[si+2];
-      out[di+3] = 255;
-    }
+  const n = amt * 28;
+  for (let i=0; i<d.length; i+=4){
+    const r = (Math.random()*2-1) * n;
+    d[i]   = clamp(d[i] + r, 0, 255);
+    d[i+1] = clamp(d[i+1] + r, 0, 255);
+    d[i+2] = clamp(d[i+2] + r, 0, 255);
   }
-  d.set(out);
 }
 
-function blockCorrupt(img, w, h, amount, t){
+function falseColor(img, amt){
   const d = img.data;
-  const blocks = Math.floor(6 + amount * 30);
+  const k = amt; // 0..1
+  for (let i=0; i<d.length; i+=4){
+    const lum = (0.2126*d[i] + 0.7152*d[i+1] + 0.0722*d[i+2]) / 255;
+    // map lum into a neon-ish palette
+    const r = clamp(255 * (1 - lum) * (0.6 + 0.4*k) + 40*k, 0, 255);
+    const g = clamp(255 * (lum)       * (0.8 + 0.2*k) + 30*k, 0, 255);
+    const b = clamp(255 * (0.35 + 0.65*Math.sin(lum*3.1415)) * (0.7 + 0.3*k), 0, 255);
 
+    d[i]   = clamp(d[i]*(1-k) + r*k, 0, 255);
+    d[i+1] = clamp(d[i+1]*(1-k) + g*k, 0, 255);
+    d[i+2] = clamp(d[i+2]*(1-k) + b*k, 0, 255);
+  }
+}
+
+function blockGlitch(img, amt){
+  const w = img.width, h = img.height;
+  const d = img.data;
+
+  const blocks = Math.floor(8 + amt*55 + bendBurst*50);
   for (let b=0; b<blocks; b++){
-    const bw = 10 + irand(44);
-    const bh = 10 + irand(36);
-    const x0 = irand(Math.max(1, w - bw));
-    const y0 = irand(Math.max(1, h - bh));
+    const bw = Math.floor(8 + rand(amt*60 + 20));
+    const bh = Math.floor(4 + rand(amt*40 + 14));
+    const x0 = Math.floor(rand(w - bw));
+    const y0 = Math.floor(rand(h - bh));
 
-    const dx = Math.floor((hash2(b, 7, t) - 0.5) * (10 + amount*90));
-    const dy = Math.floor((hash2(b, 9, t) - 0.5) * (6 + amount*50));
-
-    for (let y=0; y<bh; y++){
-      const sy = Math.max(0, Math.min(h-1, y0 + y));
-      const ty = Math.max(0, Math.min(h-1, y0 + y + dy));
-      for (let x=0; x<bw; x++){
-        const sx = Math.max(0, Math.min(w-1, x0 + x));
-        const tx = Math.max(0, Math.min(w-1, x0 + x + dx));
-        const si = (sy*w + sx) * 4;
-        const ti = (ty*w + tx) * 4;
-
-        // copy with channel scramble
-        const r = d[si], g = d[si+1], bch = d[si+2];
-        d[ti]   = g;
-        d[ti+1] = bch;
-        d[ti+2] = r;
-      }
-    }
-  }
-}
-
-function bitcrush(img, grit){
-  const d = img.data;
-  const levels = Math.max(2, Math.floor(32 - grit * 28));
-  const step = 255 / (levels - 1);
-
-  for (let i=0; i<d.length; i+=4){
-    d[i]   = Math.round(d[i]   / step) * step;
-    d[i+1] = Math.round(d[i+1] / step) * step;
-    d[i+2] = Math.round(d[i+2] / step) * step;
-  }
-}
-
-function addNoise(img, w, h, grit, t){
-  const d = img.data;
-  const amp = 6 + grit * 34;
-  for (let y=0; y<h; y++){
-    for (let x=0; x<w; x++){
-      const i = (y*w + x)*4;
-      const n = (hash2(x, y, t) - 0.5) * amp;
-      d[i]   = Math.max(0, Math.min(255, d[i] + n));
-      d[i+1] = Math.max(0, Math.min(255, d[i+1] + n));
-      d[i+2] = Math.max(0, Math.min(255, d[i+2] + n));
-    }
-  }
-}
-
-function feedbackBlend(img, prev, amount){
-  const d = img.data;
-  const a = clamp01(amount);
-  for (let i=0; i<d.length; i+=4){
-    d[i]   = d[i]   * (1-a) + prev[i]   * a;
-    d[i+1] = d[i+1] * (1-a) + prev[i+1] * a;
-    d[i+2] = d[i+2] * (1-a) + prev[i+2] * a;
-    d[i+3] = 255;
-  }
-}
-
-function updatePrev(img){
-  state.prevFrame.set(img.data);
-}
-
-/* --- False color / palette smash --- */
-
-const PALETTES = [
-  // green/magenta/cyan/yellow
-  [
-    [0,0,0], [18,24,18], [60,120,60], [30,255,80],
-    [255,0,160], [255,70,210], [120,220,255], [255,255,120]
-  ],
-  // cyan/pink/yellow
-  [
-    [0,0,0], [0,40,60], [0,180,220], [255,0,180],
-    [255,120,0], [255,255,0], [210,255,255], [255,255,255]
-  ],
-  // cheap digi bands
-  [
-    [0,0,0], [30,20,10], [80,60,25], [160,120,40],
-    [40,220,70], [220,40,210], [60,255,255], [255,255,255]
-  ]
-];
-
-function luma(r,g,b){ return (0.2126*r + 0.7152*g + 0.0722*b); }
-
-function channelMash(img, w, h, amount, t){
-  const d = img.data;
-  const perms = [
-    [0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]
-  ];
-  for (let y=0; y<h; y++){
-    const pick = (hash2(y, 77, t) < (0.10 + amount*0.55)) ? perms[irand(perms.length)] : perms[0];
-    for (let x=0; x<w; x++){
-      const i = (y*w + x)*4;
-      const r=d[i], g=d[i+1], b=d[i+2];
-      const arr=[r,g,b];
-      d[i]   = arr[pick[0]];
-      d[i+1] = arr[pick[1]];
-      d[i+2] = arr[pick[2]];
-    }
-  }
-}
-
-function falseColorMap(img, w, h, strength, t){
-  const d = img.data;
-  const pal = PALETTES[(Math.floor(t/40) % PALETTES.length)];
-  const bands = Math.max(3, Math.floor(8 - strength*5)); // 8..3
-
-  for (let i=0; i<d.length; i+=4){
-    let y = luma(d[i], d[i+1], d[i+2]) / 255;
-    const wob = (hash2(i, 17, t) - 0.5) * (0.08 + strength*0.22);
-    y = Math.max(0, Math.min(1, y + wob));
-
-    const idx = Math.max(0, Math.min(pal.length-1, Math.floor(y * (bands-1)) * Math.floor((pal.length-1)/(bands-1))));
-    const p = pal[idx];
-
-    const mix = 0.35 + strength*0.65;
-    d[i]   = d[i]   * (1-mix) + p[0]*mix;
-    d[i+1] = d[i+1] * (1-mix) + p[1]*mix;
-    d[i+2] = d[i+2] * (1-mix) + p[2]*mix;
-  }
-}
-
-function dataBars(img, w, h, amount, t){
-  const d = img.data;
-  const barChance = 0.08 + amount*0.35;
-  const bars = (hash2(9,9,t) < barChance) ? (1 + irand(3)) : 0;
-
-  for (let b=0; b<bars; b++){
-    const bw = 8 + irand(22);
-    const x0 = irand(Math.max(1, w - bw));
-    const colA = (hash2(b, 3, t) > 0.5) ? [40,255,80] : [255,0,200];
-    const colB = (hash2(b, 5, t) > 0.5) ? [255,255,0] : [0,255,255];
-
-    for (let y=0; y<h; y++){
-      const on = (Math.floor((y + t*2) / (2 + irand(3))) % 2) === 0;
-      const c = on ? colA : colB;
-      for (let x=0; x<bw; x++){
-        const i = (y*w + (x0 + x))*4;
-        d[i] = c[0]; d[i+1] = c[1]; d[i+2] = c[2];
-      }
-    }
-  }
-}
-
-function neonBlockSmash(img, w, h, amount, t){
-  const d = img.data;
-  const blocks = Math.floor(2 + amount*18);
-  const pal = PALETTES[(Math.floor(t/60) % PALETTES.length)];
-  for (let b=0; b<blocks; b++){
-    if (hash2(b, 11, t) > (0.45 + amount*0.5)) continue;
-    const bw = 10 + irand(60);
-    const bh = 10 + irand(55);
-    const x0 = irand(Math.max(1, w - bw));
-    const y0 = irand(Math.max(1, h - bh));
-    const p = pal[irand(pal.length)];
+    // shift source block from another area
+    const sx = Math.floor(clamp(x0 + (rand(1)-0.5) * (amt*80 + 30), 0, w-bw));
+    const sy = Math.floor(clamp(y0 + (rand(1)-0.5) * (amt*60 + 30), 0, h-bh));
 
     for (let y=0; y<bh; y++){
       for (let x=0; x<bw; x++){
-        const i = ((y0+y)*w + (x0+x))*4;
-        const n = (hash2(x0+x, y0+y, t) - 0.5) * (10 + amount*40);
-        d[i]   = Math.max(0, Math.min(255, p[0] + n));
-        d[i+1] = Math.max(0, Math.min(255, p[1] + n));
-        d[i+2] = Math.max(0, Math.min(255, p[2] + n));
+        const di = ((y0+y)*w + (x0+x))*4;
+        const si = ((sy+y)*w + (sx+x))*4;
+        d[di]   = d[si];
+        d[di+1] = d[si+1];
+        d[di+2] = d[si+2];
       }
     }
   }
 }
 
-/* --- Low-res date stamp (YYYY/MM/DD) --- */
-const stamp = { c: document.createElement('canvas'), ctx: null };
-stamp.ctx = stamp.c.getContext('2d', { willReadFrequently: true });
+function dataBars(ctxOut, W, H, amt){
+  const bars = Math.floor(2 + amt*7);
+  const bw = Math.floor(10 + amt*26);
 
-function drawDateStampLowRes(mainCtx, w, h){
-  const d = new Date();
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth()+1).padStart(2,'0');
-  const dd = String(d.getDate()).padStart(2,'0');
-  const text = `${yyyy}/${mm}/${dd}`;
-
-  const sw = 220, sh = 44;
-  stamp.c.width = sw; stamp.c.height = sh;
-  const s = stamp.ctx;
-  s.clearRect(0,0,sw,sh);
-
-  s.font = `900 26px ui-monospace, Menlo, Monaco, Consolas, monospace`;
-  s.textBaseline = 'top';
-
-  s.fillStyle = 'rgba(0,0,0,0.70)';
-  s.fillText(text, 3, 3);
-
-  s.fillStyle = 'rgb(255, 230, 80)';
-  s.fillText(text, 1, 1);
-
-  // speckle
-  const img = s.getImageData(0,0,sw,sh);
-  const data = img.data;
-  for (let i=0; i<data.length; i+=4){
-    const bright = data[i] + data[i+1] + data[i+2];
-    if (bright > 500 && Math.random() < 0.10){
-      const j = (Math.random() < 0.5) ? -20 : 20;
-      data[i]   = Math.max(0, Math.min(255, data[i] + j));
-      data[i+1] = Math.max(0, Math.min(255, data[i+1] + j));
-      data[i+2] = Math.max(0, Math.min(255, data[i+2] + j));
-    }
+  ctxOut.save();
+  ctxOut.globalAlpha = 0.55;
+  for (let i=0; i<bars; i++){
+    const x = Math.floor(rand(W));
+    const h2 = Math.floor(H*(0.35 + rand(0.65)));
+    ctxOut.fillStyle = `rgba(${Math.floor(rand(255))},${Math.floor(rand(255))},${Math.floor(rand(255))},1)`;
+    ctxOut.fillRect(x, Math.floor(rand(H-h2)), bw, h2);
   }
-  s.putImageData(img,0,0);
-
-  const pad = Math.max(10, Math.floor(w * 0.03));
-  const scale = Math.max(2, Math.floor(w / 240));
-  const dw = sw * scale * 0.42;
-  const dh = sh * scale * 0.42;
-
-  mainCtx.save();
-  mainCtx.imageSmoothingEnabled = false;
-  mainCtx.drawImage(stamp.c, pad, h - pad - dh, dw, dh);
-  mainCtx.restore();
+  ctxOut.restore();
 }
 
-/* ---------------- Presets & Random ---------------- */
+function feedbackPass(ctxOut, W, H, amt){
+  // smear previous frame slightly
+  fbctx.save();
+  fbctx.globalAlpha = 0.92 - amt*0.22;
+  fbctx.drawImage(canvas, 0, 0);
+  fbctx.restore();
+
+  ctxOut.save();
+  ctxOut.globalAlpha = 0.20 + amt*0.38;
+  ctxOut.globalCompositeOperation = 'screen';
+  const dx = (rand(1)-0.5) * (amt*10 + bendBurst*14);
+  const dy = (rand(1)-0.5) * (amt*8  + bendBurst*10);
+  ctxOut.drawImage(fb, dx, dy);
+  ctxOut.restore();
+}
+
+function drawDate(ctxOut, W, H){
+  // low-res stamp look
+  const pad = Math.floor(W * 0.03);
+  ctxOut.save();
+  ctxOut.imageSmoothingEnabled = false;
+  ctxOut.font = `900 ${Math.floor(W*0.038)}px ui-monospace, Menlo, Monaco, Consolas, monospace`;
+  ctxOut.fillStyle = "rgba(255,220,80,0.95)";
+  ctxOut.shadowColor = "rgba(0,0,0,0.65)";
+  ctxOut.shadowBlur = 8;
+  ctxOut.fillText(dateStamp(), pad, H - pad);
+  ctxOut.restore();
+}
 
 function applyPreset(name){
+  const set = (id, v) => document.getElementById(id).checked = v;
+  const setS = (id, v) => document.getElementById(id).value = v;
+
   if (name === "mall"){
-    ui.e_rgb.checked = true; ui.e_tear.checked = true; ui.e_blocks.checked = true;
-    ui.e_bit.checked = true; ui.e_feedback.checked = false; ui.e_noise.checked = true;
-    ui.e_false.checked = true; ui.e_bars.checked = true; ui.e_date.checked = true;
-    ui.grit.value="55"; ui.corrupt.value="52"; ui.chrom.value="62"; ui.palette.value="68";
+    set("t_blocks", true); set("t_bit", true); set("t_feedback", true);
+    set("t_noise", true); set("t_false", false); set("t_bars", false); set("t_date", true);
+    setS("s_grit", 72); setS("s_corrupt", 52); setS("s_chroma", 35); setS("s_palette", 25); setS("s_res", 280);
   }
-  if (name === "broken"){
-    ui.e_rgb.checked = true; ui.e_tear.checked = true; ui.e_blocks.checked = true;
-    ui.e_bit.checked = true; ui.e_feedback.checked = true; ui.e_noise.checked = true;
-    ui.e_false.checked = true; ui.e_bars.checked = true; ui.e_date.checked = true;
-    ui.grit.value="72"; ui.corrupt.value="82"; ui.chrom.value="74"; ui.palette.value="78";
-    bendSpike(1200);
+  if (name === "buffer"){
+    set("t_blocks", true); set("t_bit", true); set("t_feedback", true);
+    set("t_noise", true); set("t_false", true); set("t_bars", true); set("t_date", true);
+    setS("s_grit", 80); setS("s_corrupt", 70); setS("s_chroma", 62); setS("s_palette", 65); setS("s_res", 220);
   }
   if (name === "neon"){
-    ui.e_rgb.checked = true; ui.e_tear.checked = false; ui.e_blocks.checked = true;
-    ui.e_bit.checked = true; ui.e_feedback.checked = true; ui.e_noise.checked = true;
-    ui.e_false.checked = true; ui.e_bars.checked = true; ui.e_date.checked = true;
-    ui.grit.value="65"; ui.corrupt.value="70"; ui.chrom.value="55"; ui.palette.value="92";
+    set("t_blocks", true); set("t_bit", true); set("t_feedback", true);
+    set("t_noise", true); set("t_false", true); set("t_bars", false); set("t_date", true);
+    setS("s_grit", 86); setS("s_corrupt", 62); setS("s_chroma", 70); setS("s_palette", 90); setS("s_res", 200);
   }
-  if (name === "cheap"){
-    ui.e_rgb.checked = true; ui.e_tear.checked = false; ui.e_blocks.checked = true;
-    ui.e_bit.checked = true; ui.e_feedback.checked = true; ui.e_noise.checked = true;
-    ui.e_false.checked = false; ui.e_bars.checked = false; ui.e_date.checked = true;
-    ui.grit.value="62"; ui.corrupt.value="58"; ui.chrom.value="40"; ui.palette.value="55";
-  }
-  readUI();
-}
-
-function randomize(){
-  ui.e_rgb.checked = Math.random() > 0.08;
-  ui.e_tear.checked = Math.random() > 0.28;
-  ui.e_blocks.checked = Math.random() > 0.12;
-  ui.e_bit.checked = Math.random() > 0.10;
-  ui.e_feedback.checked = Math.random() > 0.38;
-  ui.e_noise.checked = Math.random() > 0.08;
-  ui.e_false.checked = Math.random() > 0.15;
-  ui.e_bars.checked = Math.random() > 0.25;
-  ui.e_date.checked = Math.random() > 0.30;
-
-  ui.grit.value = String(35 + irand(55));
-  ui.corrupt.value = String(25 + irand(70));
-  ui.chrom.value = String(20 + irand(70));
-  ui.palette.value = String(25 + irand(70));
-
-  if (Math.random() > 0.55) bendSpike(700 + irand(900));
-  readUI();
-}
-
-/* ---------------- Loop + Snap ---------------- */
-
-function loop(now){
-  readUI();
-
-  // if resolution slider changed, rebuild canvas (keeps aspect)
-  if (canvas.width !== state.baseW) {
-    const aspect = video.videoHeight / video.videoWidth || (9/16);
-    canvas.width = state.baseW;
-    canvas.height = Math.max(200, Math.round(state.baseW * aspect));
-    state.prevFrame = new Uint8ClampedArray(canvas.width * canvas.height * 4);
+  if (name === "digi"){
+    set("t_blocks", false); set("t_bit", false); set("t_feedback", false);
+    set("t_noise", true); set("t_false", false); set("t_bars", false); set("t_date", true);
+    setS("s_grit", 30); setS("s_corrupt", 18); setS("s_chroma", 20); setS("s_palette", 25); setS("s_res", 420);
   }
 
-  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-  const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
-
-  const bending = now < state.bendUntil;
-  const grit = clamp01(state.grit + (bending ? 0.25 : 0));
-  const corrupt = clamp01(state.corrupt + (bending ? 0.35 : 0));
-  const chrom = clamp01(state.chrom + (bending ? 0.35 : 0));
-  const palAmt = clamp01(state.palette + (bending ? 0.25 : 0));
-
-  const t = Math.floor(now / 33);
-
-  // CCD pipeline
-  if (ui.e_feedback.checked){
-    feedbackBlend(img, state.prevFrame, (0.10 + grit*0.35) * (bending ? 1.25 : 1.0));
-  }
-
-  if (ui.e_rgb.checked){
-    const amt = Math.floor(1 + chrom * 10 + (bending ? 6 : 0));
-    rgbSplit(img, canvas.width, canvas.height, amt);
-  }
-
-  if (ui.e_tear.checked){
-    lineTear(img, canvas.width, canvas.height, corrupt, t);
-  }
-
-  if (ui.e_blocks.checked){
-    if (Math.random() < (0.35 + corrupt*0.5) * (bending ? 1.15 : 1.0)) {
-      blockCorrupt(img, canvas.width, canvas.height, corrupt, t);
-    }
-    // neon block overlays for “palette smash” vibe
-    if (ui.e_false.checked && Math.random() < (0.22 + corrupt*0.55) * (bending ? 1.2 : 1.0)){
-      neonBlockSmash(img, canvas.width, canvas.height, palAmt, t);
-    }
-  }
-
-  if (ui.e_false.checked){
-    channelMash(img, canvas.width, canvas.height, palAmt, t);
-    falseColorMap(img, canvas.width, canvas.height, palAmt, t);
-  }
-
-  if (ui.e_bars.checked){
-    dataBars(img, canvas.width, canvas.height, palAmt, t);
-  }
-
-  if (ui.e_bit.checked){
-    bitcrush(img, grit);
-  }
-
-  if (ui.e_noise.checked){
-    addNoise(img, canvas.width, canvas.height, grit, t);
-  }
-
-  ctx.putImageData(img, 0, 0);
-  updatePrev(img);
-
-  if (ui.e_date.checked){
-    drawDateStampLowRes(ctx, canvas.width, canvas.height);
-  }
-
-  requestAnimationFrame(loop);
+  resizeAll();
 }
 
 function snap(){
-  // iOS: may open the image instead of direct download; still works to save/share.
   const a = document.createElement('a');
-  const stamp = new Date().toISOString().replace(/[:.]/g,'-');
-  a.download = `trashcam_v2_${stamp}.png`;
+  a.download = `trashcam_v2_${new Date().toISOString().replace(/[:.]/g,'-')}.png`;
   a.href = canvas.toDataURL('image/png');
   a.click();
 }
 
-/* ---------------- Events ---------------- */
+function loop(){
+  // resize if RES changed a lot (cheap check)
+  // keeping this stable helps iOS
+  const res = parseInt(ui.s_res.value, 10);
+  if (low.width !== res) resizeAll();
 
-ui.snap.addEventListener('click', snap);
+  const W = canvas.width;
+  const H = canvas.height;
 
+  // draw camera into low-res buffer (cover)
+  lctx.clearRect(0,0,low.width, low.height);
+  drawCoverTo(lctx, low.width, low.height);
+
+  let img = lctx.getImageData(0,0,low.width, low.height);
+
+  const grit = parseInt(ui.s_grit.value,10) / 100;
+  const corrupt = parseInt(ui.s_corrupt.value,10) / 100;
+  const chroma = parseInt(ui.s_chroma.value,10) / 100;
+  const palette = parseInt(ui.s_palette.value,10) / 100;
+
+  // bend burst decays
+  bendBurst = Math.max(0, bendBurst - 0.04);
+
+  if (ui.t_blocks.checked) blockGlitch(img, corrupt);
+  if (ui.t_bit.checked) bitcrush(img, grit);
+  if (chroma > 0.01) rgbSplit(img, chroma + bendBurst*0.6);
+  if (ui.t_noise.checked) noise(img, grit);
+  if (ui.t_false.checked) falseColor(img, palette);
+
+  lctx.putImageData(img, 0, 0);
+
+  // upscale to output canvas
+  ctx.save();
+  ctx.imageSmoothingEnabled = false;
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.clearRect(0,0,W,H);
+  ctx.drawImage(low, 0, 0, W, H);
+  ctx.restore();
+
+  // feedback layer (after main draw)
+  if (ui.t_feedback.checked) feedbackPass(ctx, W, H, corrupt);
+
+  // data bars overlay
+  if (ui.t_bars.checked) dataBars(ctx, W, H, corrupt + bendBurst*0.6);
+
+  // date stamp
+  if (ui.t_date.checked) drawDate(ctx, W, H);
+
+  requestAnimationFrame(loop);
+}
+
+/* Events */
 ui.flip.addEventListener('click', async () => {
   facingMode = (facingMode === "environment") ? "user" : "environment";
   await startCamera();
 });
 
-ui.bend.addEventListener('click', () => bendSpike(900));
-ui.random.addEventListener('click', randomize);
+ui.bend.addEventListener('click', () => {
+  bendBurst = 1.0;
+});
 
-ui.presetBtns.forEach(btn => {
+ui.snap.addEventListener('click', snap);
+
+// presets
+document.querySelectorAll('[data-preset]').forEach(btn => {
   btn.addEventListener('click', () => applyPreset(btn.dataset.preset));
 });
 
-/* ---------------- Start ---------------- */
+// iOS dynamic viewport handling
+if (window.visualViewport){
+  window.visualViewport.addEventListener('resize', () => resizeAll());
+  window.visualViewport.addEventListener('scroll', () => resizeAll());
+}
+window.addEventListener('orientationchange', () => resizeAll());
+window.addEventListener('resize', () => resizeAll());
 
+/* Start */
 (async () => {
   try{
+    setTip("Open in Safari + HTTPS. Hit <b>BEND</b> for a burst.");
     await startCamera();
   }catch(err){
     document.body.innerHTML = `
       <div style="padding:20px;font-family:system-ui;color:#fff">
         <h2>Camera blocked</h2>
-        <p>Open this page in <b>Safari</b>, allow Camera permissions, and make sure you’re on <b>HTTPS</b>.</p>
+        <p>Open in <b>Safari</b>, allow Camera permissions, and make sure you’re on <b>HTTPS</b>.</p>
         <pre style="white-space:pre-wrap;color:#bbb">${String(err)}</pre>
       </div>
     `;
