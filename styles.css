@@ -44,10 +44,9 @@ video, canvas{
 
 video{opacity:0}
 
-/* IMPORTANT: contain prevents stretching */
+/* contain prevents stretching; we draw our own letterboxing too */
 #screen{
   background:#000;
-  object-fit: contain;
   image-rendering: pixelated;
 }
 
@@ -209,3 +208,30 @@ input[type="range"]{width:100%}
   font-size:12px;
   line-height:1.35;
 }
+
+/* Floating SHOW HUD button */
+.floatHud{
+  position:absolute;
+  right: 12px;
+  bottom: calc(12px + var(--safe-bot));
+  z-index: 12;
+
+  display:none; /* only visible when HUD hidden */
+  border:1px solid rgba(255,255,255,.18);
+  background: rgba(0,0,0,.40);
+  color: var(--fg);
+  padding: 12px 14px;
+  border-radius: 999px;
+  font-weight: 900;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+@supports ((-webkit-backdrop-filter: blur(14px)) or (backdrop-filter: blur(14px))){
+  .floatHud{
+    background: rgba(255,255,255,.08);
+    -webkit-backdrop-filter: blur(14px);
+    backdrop-filter: blur(14px);
+  }
+}
+.floatHud:active{transform: translateY(1px)}
+.floatHud.show{display:block}
